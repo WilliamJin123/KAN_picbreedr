@@ -18,9 +18,9 @@ from .color import hsv2rgb
 class KANCPPNLayer(nn.Module):
     """A KAN layer designed for CPPN use.
 
-    Uses vectorized spline interpolation with tanh normalization for stability.
-    No bias, matching the original CPPN design. Grid spans [-3, 3] to handle
-    the wide range of intermediate values in CPPNs.
+    Uses vectorized spline interpolation with sigmoid normalization mapping
+    inputs to [0, 1] for grid lookup. No bias, matching the original CPPN
+    design. Grid spans [0, 1] to match sigmoid output range.
 
     Args:
         in_features: Number of input features.
@@ -194,20 +194,25 @@ class KAN_CPPN(nn.Module):
 class FlattenKANParameters:
     """Flatten and unflatten KAN-CPPN parameters for evolutionary algorithms.
 
-    Provides a 1D vector interface over all learnable parameters (coeffs and
-    weights) of a KAN_CPPN, matching the FlattenCPPNParameters interface from
-    the reference implementation.
+    Provides a 1D vector interface over learnable parameters of a KAN_CPPN,
+    matching the FlattenCPPNParameters interface from the reference implementation.
 
     Args:
         cppn: A KAN_CPPN instance.
+        exclude_base_weight: If True, exclude base_weight parameters from the
+            flat vector. Used by ES to avoid corrupting the orthogonal residual
+            path that prevents signal collapse in deep networks.
     """
 
-    def __init__(self, cppn):
+    def __init__(self, cppn, exclude_base_weight=False):
         self.cppn = cppn
+        self.exclude_base_weight = exclude_base_weight
         self._param_shapes = []
         self._param_names = []
         total = 0
         for name, param in cppn.named_parameters():
+            if exclude_base_weight and 'base_weight' in name:
+                continue
             self._param_names.append(name)
             self._param_shapes.append(param.shape)
             total += param.numel()
@@ -219,13 +224,15 @@ class FlattenKANParameters:
         return self._n_params
 
     def flatten(self):
-        """Flatten all learnable parameters to a 1D vector.
+        """Flatten learnable parameters to a 1D vector.
 
         Returns:
-            1D tensor of all parameters concatenated.
+            1D tensor of all included parameters concatenated.
         """
         params = []
         for name, param in self.cppn.named_parameters():
+            if self.exclude_base_weight and 'base_weight' in name:
+                continue
             params.append(param.data.reshape(-1))
         return torch.cat(params)
 
@@ -237,6 +244,8 @@ class FlattenKANParameters:
         """
         offset = 0
         for name, param in self.cppn.named_parameters():
+            if self.exclude_base_weight and 'base_weight' in name:
+                continue
             n = param.numel()
             param.data.copy_(flat_params[offset:offset + n].reshape(param.shape))
             offset += n

@@ -9,8 +9,9 @@ KAN parameters due to crossover breaking co-adapted base_weight/coeffs.
 Core algorithm per generation:
 1. Maintain a single "center" network (the current best)
 2. Sample pop_size random perturbation vectors with antithetic pairs
-3. Estimate gradient from fitness differences: g = sum(f+ - f-) * eps / (2*N*sigma)
-4. Update center parameters using ES gradient
+   (only perturbing spline coeffs and weights, NOT base_weight)
+3. Estimate gradient from normalized fitness differences
+4. Update spline parameters using ES gradient (if it improves fitness)
 5. Run K steps of SGD on center for local refinement
 """
 
@@ -27,6 +28,8 @@ class MemeticKAN_CPPN:
 
     Maintains a single center network and uses Natural Evolution Strategy
     (antithetic sampling) for global search, with SGD for local refinement.
+    ES only perturbs spline parameters (coeffs + weights), preserving the
+    orthogonal base_weight that prevents signal collapse in deep networks.
 
     Args:
         pop_size: Number of perturbation pairs per generation.
@@ -52,6 +55,10 @@ class MemeticKAN_CPPN:
 
         # Single center network
         self.center = KAN_CPPN(n_layers, hidden_size, n_inputs, grid_size).to(self.device)
+
+        # Bug 1 fix: ES flattener excludes base_weight to preserve orthogonality
+        self.es_flattener = FlattenKANParameters(self.center, exclude_base_weight=True)
+        # Full flattener for external use (weight sweeps, etc.)
         self.flattener = FlattenKANParameters(self.center)
 
         # Best fitness tracking
@@ -62,10 +69,11 @@ class MemeticKAN_CPPN:
         """Main NES-Memetic training loop.
 
         Each generation:
-        1. Sample perturbation vectors and evaluate antithetic pairs.
-        2. Compute ES gradient from fitness differences.
-        3. Update center parameters with ES gradient.
-        4. Run K steps of SGD on center for local refinement.
+        1. Sample perturbation vectors and evaluate antithetic pairs
+           (only perturbing spline coeffs + weights, not base_weight).
+        2. Compute ES gradient from normalized fitness differences.
+        3. Update spline parameters with ES gradient (only if it improves fitness).
+        4. Reset Adam state and run K steps of SGD for local refinement.
 
         Args:
             target_img: Target image tensor of shape (H, W, 3).
@@ -81,33 +89,36 @@ class MemeticKAN_CPPN:
         img_size = target_img.shape[0]
         fitness_history = []
 
-        # Persistent SGD optimizer (preserves momentum across generations)
-        sgd_optimizer = torch.optim.Adam(self.center.parameters(), lr=lr)
-
         for gen in range(n_generations):
-            # === Phase 1: ES gradient estimation ===
-            center_params = self.flattener.flatten().detach()
+            # === Phase 1: ES gradient estimation (spline params only) ===
+            center_params = self.es_flattener.flatten().detach()
             n_params = center_params.numel()
 
             epsilons = []
             fitness_diffs = []
 
             with torch.no_grad():
+                # Evaluate pre-ES fitness for gating (Bug 4 fix)
+                pre_es_img = self.center.generate_image(img_size=img_size)
+                pre_es_fitness = torch.mean((pre_es_img - target_img) ** 2).item()
+
                 for i in range(self.pop_size):
                     eps = torch.randn(n_params, device=self.device)
                     epsilons.append(eps)
 
                     # Positive perturbation
-                    self.flattener.unflatten(center_params + self.sigma * eps)
+                    self.es_flattener.unflatten(center_params + self.sigma * eps)
                     img_pos = self.center.generate_image(img_size=img_size)
                     f_pos = torch.mean((img_pos - target_img) ** 2).item()
 
                     # Negative perturbation (antithetic)
-                    self.flattener.unflatten(center_params - self.sigma * eps)
+                    self.es_flattener.unflatten(center_params - self.sigma * eps)
                     img_neg = self.center.generate_image(img_size=img_size)
                     f_neg = torch.mean((img_neg - target_img) ** 2).item()
 
-                    fitness_diffs.append(f_pos - f_neg)
+                    # Bug 5 fix: normalize fitness differences for stability
+                    denom = abs(f_pos) + abs(f_neg) + 1e-8
+                    fitness_diffs.append((f_pos - f_neg) / denom)
 
             # Compute ES gradient
             es_grad = torch.zeros(n_params, device=self.device)
@@ -115,11 +126,24 @@ class MemeticKAN_CPPN:
                 es_grad += fd * eps
             es_grad /= (2 * self.pop_size * self.sigma)
 
-            # Apply ES update
-            new_params = center_params - self.lr_es * es_grad
-            self.flattener.unflatten(new_params)
+            # Apply ES update to candidate
+            candidate_params = center_params - self.lr_es * es_grad
+
+            # Bug 4 fix: only accept ES update if it improves fitness
+            with torch.no_grad():
+                self.es_flattener.unflatten(candidate_params)
+                post_es_img = self.center.generate_image(img_size=img_size)
+                post_es_fitness = torch.mean((post_es_img - target_img) ** 2).item()
+
+                if post_es_fitness >= pre_es_fitness:
+                    # ES made things worse — revert
+                    self.es_flattener.unflatten(center_params)
 
             # === Phase 2: SGD local refinement ===
+            # Bug 2 fix: fresh optimizer each generation so state matches
+            # current parameters (ES may have just moved them)
+            sgd_optimizer = torch.optim.Adam(self.center.parameters(), lr=lr)
+
             self.center.train()
             for step in range(sgd_steps_per_gen):
                 sgd_optimizer.zero_grad()
