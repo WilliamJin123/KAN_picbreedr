@@ -33,7 +33,7 @@ GENOME_CONFIGS = {
 
 
 def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
-               img_size, output_dir):
+               img_size, output_dir, device='cpu'):
     """Train SwarmKAN vs vanilla KAN on one genome."""
     genome_dir = os.path.join(output_dir, genome)
     os.makedirs(genome_dir, exist_ok=True)
@@ -46,6 +46,7 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
     print(f"{'='*60}")
 
     # --- Load target image ---
+    print(f"  Device: {device}")
     print("  Loading picbreeder target...")
     arch, params = load_genome('picbreeder', genome)
     cppn = CPPN(arch)
@@ -61,7 +62,7 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
         hidden_size=config['hidden_size'],
         n_inputs=4,
         grid_size=grid_size,
-    )
+    ).to(device)
     losses_kan, kan = train_sgd(
         kan, target_img.detach(), lr=lr, n_iters=n_iters,
         log_interval=max(1, n_iters // 10),
@@ -75,7 +76,7 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
         n_inputs=4,
         grid_size=grid_size,
         n_particles=n_particles,
-    )
+    ).to(device)
     losses_swarm, swarm_kan = train_swarm(
         swarm_kan, target_img.detach(), lr=lr, n_iters=n_iters,
         swarm_interval=swarm_interval,
@@ -190,7 +191,15 @@ def main():
                         help="Training image size (default: 128)")
     parser.add_argument('--output_dir', type=str, default='output/phase3',
                         help="Output directory (default: output/phase3)")
+    parser.add_argument('--device', type=str, default=None,
+                        help="Device to use (default: auto-detect cuda/cpu)")
     args = parser.parse_args()
+
+    # Auto-detect device
+    if args.device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = args.device
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -200,13 +209,14 @@ def main():
     print(f"Genomes: {genomes}")
     print(f"Iterations: {args.n_iters}, LR: {args.lr}")
     print(f"Particles: {args.n_particles}, Swarm interval: {args.swarm_interval}")
+    print(f"Device: {device}")
     print(f"Output: {args.output_dir}")
 
     for genome in genomes:
         try:
             run_genome(genome, args.n_iters, args.lr, args.grid_size,
                        args.n_particles, args.swarm_interval,
-                       args.img_size, args.output_dir)
+                       args.img_size, args.output_dir, device=device)
         except Exception as e:
             print(f"\nERROR processing {genome}: {e}")
             import traceback

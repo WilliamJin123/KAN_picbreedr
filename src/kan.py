@@ -67,26 +67,26 @@ class KANCPPNLayer(nn.Module):
         x_norm = torch.sigmoid(x)  # (batch_size, in_features)
         scaled = x_norm * (self.grid_size - 1)  # (batch_size, in_features)
 
-        # Add dimension for out_features broadcasting
-        scaled = scaled.unsqueeze(1)  # (batch_size, 1, in_features)
+        idx = scaled.long().clamp(0, self.grid_size - 2)  # (batch_size, in_features)
+        frac = scaled - idx.float()  # (batch_size, in_features)
 
-        idx = scaled.long().clamp(0, self.grid_size - 2)  # (batch_size, 1, in_features)
-        frac = scaled - idx.float()  # (batch_size, 1, in_features)
+        # Spline evaluation via gather on (in, out, grid) layout.
+        # coeffs: (out, in, grid) -> permute to (in, out, grid) so gather is along grid dim.
+        coeffs_iog = self.coeffs.permute(1, 0, 2)  # (in, out, grid)
 
-        # Expand indices for gathering from coeffs
-        idx_expanded = idx.expand(-1, self.out_features, -1)  # (batch_size, out_features, in_features)
+        # idx: (batch, in) -> (in, batch) -> (in, out, batch) for gathering from (in, out, grid)
+        idx_gather = idx.T.unsqueeze(1).expand(-1, self.out_features, -1)  # (in, out, batch)
+        left = coeffs_iog.gather(2, idx_gather)   # (in, out, batch)
+        right = coeffs_iog.gather(2, idx_gather + 1)  # (in, out, batch)
 
-        out_indices = torch.arange(self.out_features, device=x.device).view(1, -1, 1)
-        in_indices = torch.arange(self.in_features, device=x.device).view(1, 1, -1)
+        # Linear interpolation: frac (batch, in) -> (in, 1, batch) for broadcasting
+        frac_t = frac.T.unsqueeze(1)  # (in, 1, batch)
+        interpolated = left + frac_t * (right - left)  # (in, out, batch)
 
-        coeffs_left = self.coeffs[out_indices, in_indices, idx_expanded]
-        coeffs_right = self.coeffs[out_indices, in_indices, idx_expanded + 1]
-
-        # Linear interpolation
-        interpolated = (1 - frac) * coeffs_left + frac * coeffs_right  # (batch_size, out_features, in_features)
-
-        # Weight and sum across input features for spline path
-        spline_output = (interpolated * self.weights.unsqueeze(0)).sum(dim=2)  # (batch_size, out_features)
+        # Apply weights and sum over input features
+        # weights: (out, in) -> (in, out, 1) for broadcasting
+        weighted = interpolated * self.weights.T.unsqueeze(2)  # (in, out, batch)
+        spline_output = weighted.sum(dim=0).T  # (batch, out)
 
         return base + spline_output
 
