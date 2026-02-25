@@ -74,7 +74,6 @@ class CPPN(nn.Module):
         h, s, v = x[..., 0], x[..., 1], x[..., 2]
         return (h, s, v), features
 
-    @torch.no_grad()
     def generate_image(self, img_size=256, return_features=False):
         """Generate an image from the CPPN at the given resolution.
 
