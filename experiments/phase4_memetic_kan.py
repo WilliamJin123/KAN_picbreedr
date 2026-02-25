@@ -28,6 +28,8 @@ from src import MemeticKAN_CPPN
 from src import load_genome, train_memetic
 from src import viz_feature_maps, sweep_weight, plot_sweep_grid
 from src import discover_interesting_kan_sweeps
+from src import sweep_all_edges, save_sweep_pages
+from src import build_kan_graph_data, render_pruned_graph, render_full_graph_by_layer
 
 # Architecture configs
 GENOME_CONFIGS = {
@@ -57,7 +59,8 @@ MUTATION_WEIGHTS = {
 
 
 def run_phase4(genome, n_generations, pop_size, sgd_steps, lr, grid_size,
-               img_size, sigma, lr_es, output_dir):
+               img_size, sigma, lr_es, output_dir,
+               checkpoint_interval=100, resume_from=None):
     """Phase 4: NES-Memetic KAN training."""
     genome_dir = os.path.join(output_dir, genome)
     os.makedirs(genome_dir, exist_ok=True)
@@ -80,7 +83,7 @@ def run_phase4(genome, n_generations, pop_size, sgd_steps, lr, grid_size,
 
     # Save target
     fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-    ax.imshow(target_img.cpu().numpy())
+    ax.imshow(target_img.detach().cpu().numpy())
     ax.set_title(f"Picbreeder {genome} (target)", fontsize=14)
     ax.axis('off')
     fig.savefig(os.path.join(genome_dir, "target.png"), bbox_inches='tight')
@@ -98,6 +101,7 @@ def run_phase4(genome, n_generations, pop_size, sgd_steps, lr, grid_size,
         lr_es=lr_es,
     )
 
+    ckpt_dir = os.path.join(genome_dir, "checkpoints")
     print(f"  Evolving for {n_generations} generations...")
     fitness_history, best = train_memetic(
         memetic, target_img.detach(),
@@ -105,6 +109,9 @@ def run_phase4(genome, n_generations, pop_size, sgd_steps, lr, grid_size,
         sgd_steps_per_gen=sgd_steps,
         lr=lr,
         log_interval=max(1, n_generations // 10),
+        checkpoint_dir=ckpt_dir,
+        checkpoint_interval=checkpoint_interval,
+        resume_from=resume_from,
     )
 
     # --- Generate best individual's image ---
@@ -113,11 +120,11 @@ def run_phase4(genome, n_generations, pop_size, sgd_steps, lr, grid_size,
         best_img, features_best = best.generate_image(img_size=img_size, return_features=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6), dpi=150)
-    axes[0].imshow(target_img.cpu().numpy())
+    axes[0].imshow(target_img.detach().cpu().numpy())
     axes[0].set_title("Picbreeder (target)", fontsize=14)
     axes[0].axis('off')
 
-    axes[1].imshow(best_img.cpu().numpy())
+    axes[1].imshow(best_img.detach().cpu().numpy())
     final_fitness = fitness_history[-1]
     axes[1].set_title(f"MemeticKAN (MSE={final_fitness:.6f})", fontsize=14)
     axes[1].axis('off')
@@ -163,7 +170,7 @@ def run_phase4(genome, n_generations, pop_size, sgd_steps, lr, grid_size,
                 img_size=img_size, r=1, n=5,
             )
             sweep_data.append({
-                'imgs': imgs,
+                'imgs': imgs.detach().cpu(),
                 'weight_id': entry['flat_idx'],
                 'description': entry['description'],
             })
@@ -174,6 +181,21 @@ def run_phase4(genome, n_generations, pop_size, sgd_steps, lr, grid_size,
         fig = plot_sweep_grid(sweep_data, title=f"MemeticKAN {genome} Weight Sweeps")
         fig.savefig(os.path.join(genome_dir, "sweep_grid.png"), bbox_inches='tight')
         plt.close(fig)
+
+    # --- Exhaustive per-edge weight sweeps ---
+    print("  Generating exhaustive edge sweeps...")
+    sweep_dir = os.path.join(genome_dir, "sweeps")
+    sweep_results = sweep_all_edges(best, best_flat, img_size=64, n_sweep=5)
+    save_sweep_pages(sweep_results, sweep_dir, title_prefix=f"Memetic {genome}")
+
+    # --- Architecture graph ---
+    print("  Generating architecture graph...")
+    graph_dir = os.path.join(genome_dir, "graph")
+    os.makedirs(graph_dir, exist_ok=True)
+    graph_data = build_kan_graph_data(best)
+    render_pruned_graph(graph_data, os.path.join(graph_dir, "pruned.png"),
+                       title=f"MemeticKAN {genome} (pruned)")
+    render_full_graph_by_layer(graph_data, graph_dir, title_prefix=f"Memetic {genome}")
 
     # Save fitness data
     np.save(os.path.join(genome_dir, "fitness_history.npy"), np.array(fitness_history))
@@ -255,19 +277,19 @@ def run_phase4_1(genome, memetic, n_generations, sgd_steps, lr, grid_size,
     # --- Plot comparison ---
     fig, axes = plt.subplots(2, 2, figsize=(12, 12), dpi=150)
 
-    axes[0, 0].imshow(original_img.cpu().numpy())
+    axes[0, 0].imshow(original_img.detach().cpu().numpy())
     axes[0, 0].set_title("Original Picbreeder", fontsize=14)
     axes[0, 0].axis('off')
 
-    axes[0, 1].imshow(mutated_img.cpu().numpy())
+    axes[0, 1].imshow(mutated_img.detach().cpu().numpy())
     axes[0, 1].set_title(f"Mutated (w{w_id} + {delta})", fontsize=14)
     axes[0, 1].axis('off')
 
-    axes[1, 0].imshow(reconstructed_img.cpu().numpy())
+    axes[1, 0].imshow(reconstructed_img.detach().cpu().numpy())
     axes[1, 0].set_title(f"KAN Reconstruction\n(MSE={mse_reconstruction:.6f})", fontsize=14)
     axes[1, 0].axis('off')
 
-    axes[1, 1].imshow(reset_img.cpu().numpy())
+    axes[1, 1].imshow(reset_img.detach().cpu().numpy())
     axes[1, 1].set_title(f"KAN Reset (weights=1.0)\nvs orig MSE={mse_reset_vs_original:.4f}", fontsize=14)
     axes[1, 1].axis('off')
 
@@ -331,6 +353,10 @@ def main():
                         help="Output directory (default: output/phase4)")
     parser.add_argument('--skip_4_1', action='store_true',
                         help="Skip Phase 4.1 weight reset experiment")
+    parser.add_argument('--checkpoint_interval', type=int, default=100,
+                        help="Checkpoint every N iterations (default: 100)")
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help="Path to checkpoint to resume from")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -347,6 +373,8 @@ def main():
             args.genome, args.n_generations, args.pop_size,
             args.sgd_steps, args.lr, args.grid_size,
             args.img_size, args.sigma, args.lr_es, args.output_dir,
+            checkpoint_interval=args.checkpoint_interval,
+            resume_from=args.resume_from,
         )
 
         if not args.skip_4_1:

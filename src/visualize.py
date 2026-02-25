@@ -173,6 +173,7 @@ def discover_interesting_kan_sweeps(kan_cppn, kan_flat, target_img, img_size=64,
 
             # Visual impact = mean absolute pixel difference
             impact = torch.mean(torch.abs(img_high - img_low)).item()
+            del p_low, p_high, img_low, img_high
 
             info = get_kan_param_info(kan_cppn, flat_idx)
             scored.append({
@@ -215,7 +216,8 @@ def sweep_weight(params, weight_id, cppn_flat, img_size=256, center_weight=None,
         p = params.clone()
         p[weight_id] = w_val
         img = cppn_flat.generate_image(p, img_size=img_size)
-        imgs.append(img)
+        imgs.append(img.detach().cpu())
+        del p, img
 
     return torch.stack(imgs)
 
@@ -266,7 +268,8 @@ def sweep_weight_random_direction(params, seed, cppn_flat, img_size=256, r=1, n=
         # dW is in Flax layout (in, out), PyTorch weight is (out, in)
         layer.weight.data += (t * dW).T
         img = cppn.generate_image(img_size=img_size)
-        imgs.append(img)
+        imgs.append(img.detach().cpu())
+        del img
 
     return torch.stack(imgs)
 
@@ -360,3 +363,169 @@ def plot_sweep_grid(sweep_data, title="", padding=6):
         fig.suptitle(title, fontsize=35)
     fig.tight_layout()
     return fig
+
+
+def sweep_all_edges(kan_cppn, kan_flat, img_size=64, n_sweep=5, r=1.0):
+    """Generate weight sweep images for every edge in every layer.
+
+    For each KAN layer, iterates over all (out, in) edges and sweeps the
+    spline coefficients along a unit direction, generating n_sweep images.
+
+    Args:
+        kan_cppn: A KAN_CPPN instance.
+        kan_flat: A FlattenKANParameters instance wrapping kan_cppn.
+        img_size: Resolution of generated images.
+        n_sweep: Number of sweep steps from -r to +r.
+        r: Sweep radius.
+
+    Returns:
+        List of dicts (one per layer), each with keys:
+            layer_idx: Index of the layer.
+            in_features: Number of input features.
+            out_features: Number of output features.
+            edges: List of dicts with keys:
+                in_idx, out_idx: Edge indices.
+                imgs: Tensor of shape (n_sweep, img_size, img_size, 3).
+    """
+    results = []
+    params = kan_flat.flatten()
+    sweep_scales = torch.linspace(-r, r, n_sweep)
+
+    with torch.no_grad():
+        for layer_idx, layer in enumerate(kan_cppn.layers):
+            layer_result = {
+                'layer_idx': layer_idx,
+                'in_features': layer.in_features,
+                'out_features': layer.out_features,
+                'edges': [],
+            }
+
+            for out_idx in range(layer.out_features):
+                for in_idx in range(layer.in_features):
+                    edge_coeffs = layer.coeffs[out_idx, in_idx]
+                    n_basis = edge_coeffs.numel()
+                    offset = _find_coeffs_offset(kan_cppn, kan_flat, layer_idx, out_idx, in_idx)
+
+                    direction = torch.zeros_like(params)
+                    direction[offset:offset + n_basis] = 1.0 / (n_basis ** 0.5)
+
+                    imgs = []
+                    for scale in sweep_scales:
+                        p = params.clone()
+                        p += scale * direction
+                        img = kan_flat.generate_image(p, img_size=img_size)
+                        imgs.append(img.detach().cpu())
+                        del p, img
+
+                    layer_result['edges'].append({
+                        'in_idx': in_idx,
+                        'out_idx': out_idx,
+                        'imgs': torch.stack(imgs),
+                    })
+                    del imgs
+
+            results.append(layer_result)
+
+    kan_flat.unflatten(params)
+    return results
+
+
+def _find_coeffs_offset(kan_cppn, kan_flat, target_layer_idx, out_idx, in_idx):
+    """Find the flat parameter offset for a specific edge's coefficients.
+
+    Iterates through named_parameters in the same order as FlattenKANParameters,
+    respecting the exclude_base_weight setting, to compute the correct offset.
+
+    Args:
+        kan_cppn: A KAN_CPPN instance.
+        kan_flat: A FlattenKANParameters instance (needed to respect exclusions).
+        target_layer_idx: Which layer the edge belongs to.
+        out_idx: Output neuron index.
+        in_idx: Input neuron index.
+
+    Returns:
+        Integer offset into the flat parameter vector.
+    """
+    offset = 0
+    for name, param in kan_cppn.named_parameters():
+        if kan_flat.exclude_base_weight and 'base_weight' in name:
+            continue
+
+        parts = name.split('.')
+        layer_idx = int(parts[1])
+        param_type = parts[2]
+
+        if layer_idx == target_layer_idx and param_type == 'coeffs':
+            # coeffs shape: (out_features, in_features, n_basis)
+            n_basis = param.shape[2]
+            in_features = param.shape[1]
+            local_offset = out_idx * (in_features * n_basis) + in_idx * n_basis
+            return offset + local_offset
+
+        offset += param.numel()
+
+    raise ValueError(f"Could not find coeffs for layer {target_layer_idx}")
+
+
+def save_sweep_pages(sweep_results, output_dir, title_prefix="", img_size_display=None):
+    """Save per-layer sweep grids as PNG files.
+
+    Creates one PNG per layer showing all edge sweeps in a grid where rows
+    are edges and columns are sweep steps.
+
+    Args:
+        sweep_results: Output from sweep_all_edges().
+        output_dir: Directory to save PNG files.
+        title_prefix: Optional prefix for figure titles.
+        img_size_display: Unused, reserved for future customization.
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    for layer_data in sweep_results:
+        layer_idx = layer_data['layer_idx']
+        edges = layer_data['edges']
+        n_edges = len(edges)
+        n_sweep = edges[0]['imgs'].shape[0] if edges else 0
+
+        if n_edges == 0:
+            continue
+
+        cell_size = 0.6
+        fig_width = n_sweep * cell_size + 2
+        fig_height = n_edges * cell_size + 1.5
+
+        fig, axs = plt.subplots(
+            n_edges, n_sweep,
+            figsize=(fig_width, fig_height),
+            dpi=100,
+            squeeze=False,
+        )
+
+        for row, edge in enumerate(edges):
+            imgs = edge['imgs']
+            if isinstance(imgs, torch.Tensor):
+                imgs = imgs.detach().cpu().numpy()
+            for col in range(n_sweep):
+                ax = axs[row, col]
+                ax.imshow(imgs[col])
+                ax.set_xticks([])
+                ax.set_yticks([])
+                if col == 0:
+                    ax.set_ylabel(f"({edge['in_idx']}->{edge['out_idx']})",
+                                  fontsize=6, rotation=0, labelpad=30, va='center')
+
+        prefix = f"{title_prefix} " if title_prefix else ""
+        fig.suptitle(
+            f"{prefix}Layer {layer_idx} "
+            f"({layer_data['in_features']} in x {layer_data['out_features']} out = {n_edges} edges)",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        try:
+            fig.savefig(
+                os.path.join(output_dir, f'layer_{layer_idx:02d}.png'),
+                bbox_inches='tight',
+            )
+        finally:
+            plt.close(fig)

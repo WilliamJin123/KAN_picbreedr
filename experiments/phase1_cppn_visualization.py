@@ -163,7 +163,7 @@ def run_genome(source, genome, img_size, output_dir, n_random_sweeps=200, top_k=
             )
             # Compute variance across the sweep (a measure of how much this direction matters)
             variance = imgs.var(dim=0).mean().item()
-            random_sweeps.append((seed, variance, imgs))
+            random_sweeps.append((seed, variance, imgs.cpu()))
         except Exception as e:
             print(f"    Warning: seed {seed} failed: {e}")
 

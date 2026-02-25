@@ -67,7 +67,8 @@ class MemeticKAN_CPPN:
         self.best_fitness = float('inf')
 
     def evolve(self, target_img, n_generations=100, sgd_steps_per_gen=50,
-               lr=3e-3, log_interval=10):
+               lr=3e-3, log_interval=10, start_generation=0,
+               initial_fitness_history=None, checkpoint_callback=None):
         """Main NES-Memetic training loop.
 
         Each generation:
@@ -89,9 +90,9 @@ class MemeticKAN_CPPN:
         """
         target_img = target_img.to(self.device)
         img_size = target_img.shape[0]
-        fitness_history = []
+        fitness_history = list(initial_fitness_history) if initial_fitness_history else []
 
-        for gen in range(n_generations):
+        for gen in range(start_generation, n_generations):
             # === Phase 1: ES gradient estimation (spline params only) ===
             center_params = self.es_flattener.flatten().detach()
             n_params = center_params.numel()
@@ -127,6 +128,9 @@ class MemeticKAN_CPPN:
             for fd, eps in zip(fitness_diffs, epsilons):
                 es_grad += fd * eps
             es_grad /= (2 * self.pop_size * self.sigma)
+
+            # Free ES evaluation tensors before SGD phase
+            del epsilons, fitness_diffs
 
             # Apply ES update to candidate
             candidate_params = center_params - self.lr_es * es_grad
@@ -173,6 +177,9 @@ class MemeticKAN_CPPN:
 
             self.best_fitness = min(self.best_fitness, fitness)
             fitness_history.append(self.best_fitness)
+
+            if checkpoint_callback is not None:
+                checkpoint_callback(gen, fitness_history)
 
             if log_interval and (gen + 1) % log_interval == 0:
                 print(f"Generation {gen+1}/{n_generations}, "

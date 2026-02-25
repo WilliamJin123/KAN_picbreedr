@@ -63,10 +63,10 @@ class SwarmKANCPPNLayer(KANCPPNLayer):
         """
         # Update personal and global best for particle 0 (the active one)
         if current_loss is not None:
-            self.particles[0] = self.coeffs.data.clone()
+            self.particles[0].copy_(self.coeffs.data)
             if current_loss < self.personal_best_scores[0]:
                 self.personal_best_scores[0] = current_loss
-                self.personal_best[0] = self.coeffs.data.clone()
+                self.personal_best[0].copy_(self.coeffs.data)
             if current_loss < self.global_best_score:
                 self.global_best_score.fill_(current_loss)
                 self.global_best.copy_(self.coeffs.data)

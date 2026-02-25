@@ -23,6 +23,8 @@ from src import SwarmKAN_CPPN
 from src import load_genome, train_sgd, train_swarm
 from src import viz_feature_maps, sweep_weight, plot_sweep_grid
 from src import discover_interesting_kan_sweeps
+from src import sweep_all_edges, save_sweep_pages
+from src import build_kan_graph_data, render_pruned_graph, render_full_graph_by_layer
 
 # Architecture configs
 GENOME_CONFIGS = {
@@ -33,7 +35,8 @@ GENOME_CONFIGS = {
 
 
 def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
-               img_size, output_dir, device='cpu'):
+               img_size, output_dir, device='cpu',
+               checkpoint_interval=100, resume_from=None, spline_degree=1):
     """Train SwarmKAN vs vanilla KAN on one genome."""
     genome_dir = os.path.join(output_dir, genome)
     os.makedirs(genome_dir, exist_ok=True)
@@ -62,10 +65,15 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
         hidden_size=config['hidden_size'],
         n_inputs=4,
         grid_size=grid_size,
+        spline_degree=spline_degree,
     ).to(device)
+    ckpt_dir_kan = os.path.join(genome_dir, "checkpoints_kan")
     losses_kan, kan = train_sgd(
         kan, target_img.detach(), lr=lr, n_iters=n_iters,
         log_interval=max(1, n_iters // 10),
+        checkpoint_dir=ckpt_dir_kan,
+        checkpoint_interval=checkpoint_interval,
+        resume_from=resume_from,
     )
 
     # --- Train SwarmKAN-CPPN ---
@@ -75,12 +83,17 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
         hidden_size=config['hidden_size'],
         n_inputs=4,
         grid_size=grid_size,
+        spline_degree=spline_degree,
         n_particles=n_particles,
     ).to(device)
+    ckpt_dir_swarm = os.path.join(genome_dir, "checkpoints_swarm")
     losses_swarm, swarm_kan = train_swarm(
         swarm_kan, target_img.detach(), lr=lr, n_iters=n_iters,
         swarm_interval=swarm_interval,
         log_interval=max(1, n_iters // 10),
+        checkpoint_dir=ckpt_dir_swarm,
+        checkpoint_interval=checkpoint_interval,
+        resume_from=resume_from,
     )
 
     # --- Generate images ---
@@ -105,15 +118,15 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
 
     # --- Side-by-side comparison ---
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=150)
-    axes[0].imshow(target_img.cpu().numpy())
+    axes[0].imshow(target_img.detach().cpu().numpy())
     axes[0].set_title("Picbreeder (target)", fontsize=14)
     axes[0].axis('off')
 
-    axes[1].imshow(kan_img.cpu().numpy())
+    axes[1].imshow(kan_img.detach().cpu().numpy())
     axes[1].set_title(f"Vanilla KAN (MSE={losses_kan[-1]:.6f})", fontsize=14)
     axes[1].axis('off')
 
-    axes[2].imshow(swarm_img.cpu().numpy())
+    axes[2].imshow(swarm_img.detach().cpu().numpy())
     axes[2].set_title(f"SwarmKAN (MSE={losses_swarm[-1]:.6f})", fontsize=14)
     axes[2].axis('off')
 
@@ -151,7 +164,7 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
                     img_size=img_size, r=1, n=5,
                 )
                 sweep_data.append({
-                    'imgs': imgs,
+                    'imgs': imgs.detach().cpu(),
                     'weight_id': entry['flat_idx'],
                     'description': entry['description'],
                 })
@@ -162,6 +175,24 @@ def run_genome(genome, n_iters, lr, grid_size, n_particles, swarm_interval,
             fig = plot_sweep_grid(sweep_data, title=f"{model_name.upper()} {genome} Weight Sweeps")
             fig.savefig(os.path.join(genome_dir, f"sweep_grid_{model_name}.png"), bbox_inches='tight')
             plt.close(fig)
+
+    # --- Exhaustive per-edge weight sweeps ---
+    for model_name, model in [("kan", kan), ("swarm", swarm_kan)]:
+        print(f"  Generating exhaustive edge sweeps for {model_name}...")
+        flat = FlattenKANParameters(model)
+        sweep_dir = os.path.join(genome_dir, f"sweeps_{model_name}")
+        sweep_results = sweep_all_edges(model, flat, img_size=64, n_sweep=5)
+        save_sweep_pages(sweep_results, sweep_dir, title_prefix=f"{model_name.upper()} {genome}")
+
+    # --- Architecture graphs ---
+    for model_name, model in [("kan", kan), ("swarm", swarm_kan)]:
+        print(f"  Generating architecture graph for {model_name}...")
+        graph_dir = os.path.join(genome_dir, f"graph_{model_name}")
+        os.makedirs(graph_dir, exist_ok=True)
+        graph_data = build_kan_graph_data(model)
+        render_pruned_graph(graph_data, os.path.join(graph_dir, "pruned.png"),
+                           title=f"{model_name.upper()} {genome} (pruned)")
+        render_full_graph_by_layer(graph_data, graph_dir, title_prefix=f"{model_name.upper()} {genome}")
 
     # Save loss data
     np.save(os.path.join(genome_dir, "losses_kan.npy"), np.array(losses_kan))
@@ -193,6 +224,12 @@ def main():
                         help="Output directory (default: output/phase3)")
     parser.add_argument('--device', type=str, default=None,
                         help="Device to use (default: auto-detect cuda/cpu)")
+    parser.add_argument('--checkpoint_interval', type=int, default=100,
+                        help="Checkpoint every N iterations (default: 100)")
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    parser.add_argument('--spline_degree', type=int, default=1,
+                        help="B-spline degree (1-4, default: 1)")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -216,7 +253,10 @@ def main():
         try:
             run_genome(genome, args.n_iters, args.lr, args.grid_size,
                        args.n_particles, args.swarm_interval,
-                       args.img_size, args.output_dir, device=device)
+                       args.img_size, args.output_dir, device=device,
+                       checkpoint_interval=args.checkpoint_interval,
+                       resume_from=args.resume_from,
+                       spline_degree=args.spline_degree)
         except Exception as e:
             print(f"\nERROR processing {genome}: {e}")
             import traceback
