@@ -980,9 +980,8 @@ result = self.coeffs.data[idx]  # ← WRONG, breaks gradient computation
 
 ## What's Next
 
-- **Tutorial 04**: Swapping MLP layers for KAN layers in the CPPN — making our CPPN use learnable spline edges instead of fixed activations
-- **Tutorial 05**: Weight sweeps, feature maps, and visualizing what the CPPN learns
-- **Tutorial 06**: Swarm-based and evolutionary optimization for KAN-CPPN hybrids
+- **Tutorial 04**: Particle swarm optimization for KAN-CPPNs — attaching PSO to spline coefficients for hybrid exploration alongside SGD
+- **Tutorial 05**: Memetic KAN with Natural Evolution Strategy + SGD — why crossover fails for KANs, antithetic gradient estimation, and selective parameter perturbation
 
 ---
 
