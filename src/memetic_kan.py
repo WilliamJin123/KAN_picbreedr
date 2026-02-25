@@ -37,24 +37,26 @@ class MemeticKAN_CPPN:
         hidden_size: Neurons per hidden layer.
         n_inputs: Number of coordinate inputs.
         grid_size: Grid points for spline interpolation.
+        spline_degree: B-spline degree (1=linear, 2=quadratic, 3=cubic).
         sigma: Perturbation scale for ES.
         lr_es: Learning rate for ES gradient updates.
         device: Torch device for computation.
     """
 
     def __init__(self, pop_size=20, n_layers=12, hidden_size=22, n_inputs=4,
-                 grid_size=20, sigma=0.02, lr_es=0.01, device=None):
+                 grid_size=20, spline_degree=1, sigma=0.02, lr_es=0.01, device=None):
         self.pop_size = pop_size
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.n_inputs = n_inputs
         self.grid_size = grid_size
+        self.spline_degree = spline_degree
         self.sigma = sigma
         self.lr_es = lr_es
         self.device = device or torch.device('cpu')
 
         # Single center network
-        self.center = KAN_CPPN(n_layers, hidden_size, n_inputs, grid_size).to(self.device)
+        self.center = KAN_CPPN(n_layers, hidden_size, n_inputs, grid_size, spline_degree).to(self.device)
 
         # Bug 1 fix: ES flattener excludes base_weight to preserve orthogonality
         self.es_flattener = FlattenKANParameters(self.center, exclude_base_weight=True)

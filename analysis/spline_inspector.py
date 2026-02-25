@@ -8,6 +8,7 @@ the KAN learned.
 import torch
 import numpy as np
 from scipy.optimize import curve_fit
+from scipy.interpolate import BSpline
 
 
 # Library of known activation functions (evaluated on raw input domain)
@@ -45,7 +46,7 @@ def extract_spline_curve(layer, in_idx, out_idx, n_points=1000):
     Evaluates the spline at n_points uniformly spaced inputs by:
     1. Creating inputs in the raw domain [-3, 3]
     2. Applying sigmoid to map to [0, 1] (the grid domain)
-    3. Interpolating on the spline grid
+    3. Interpolating on the spline grid (linear for degree 1, scipy BSpline for higher)
     4. Multiplying by the edge weight
 
     Args:
@@ -62,20 +63,29 @@ def extract_spline_curve(layer, in_idx, out_idx, n_points=1000):
     raw_inputs = np.linspace(-3, 3, n_points)
     normalized = 1 / (1 + np.exp(-raw_inputs))  # sigmoid
 
-    # Map to grid indices
-    grid_size = layer.grid_size
-    scaled = normalized * (grid_size - 1)
-    idx = np.clip(scaled.astype(int), 0, grid_size - 2)
-    frac = scaled - idx
-
-    # Get coefficients for this edge
-    coeffs = layer.coeffs[out_idx, in_idx].detach().cpu().numpy()  # (grid_size,)
+    # Get coefficients and weight for this edge
+    coeffs = layer.coeffs[out_idx, in_idx].detach().cpu().numpy()
     weight = layer.weights[out_idx, in_idx].detach().cpu().item()
 
-    # Linear interpolation
-    left = coeffs[idx]
-    right = coeffs[idx + 1]
-    spline_values = (left + frac * (right - left)) * weight
+    degree = getattr(layer, 'spline_degree', 1)
+
+    if degree == 1:
+        # Original linear interpolation (unchanged)
+        grid_size = layer.grid_size
+        scaled = normalized * (grid_size - 1)
+        idx = np.clip(scaled.astype(int), 0, grid_size - 2)
+        frac = scaled - idx
+
+        left = coeffs[idx]
+        right = coeffs[idx + 1]
+        spline_values = (left + frac * (right - left)) * weight
+    else:
+        # Higher-degree B-spline via scipy
+        knots = layer.knots.detach().cpu().numpy()
+        spl = BSpline(knots, coeffs, degree, extrapolate=False)
+        # Clamp to valid domain to avoid NaN at boundaries
+        t_clamped = np.clip(normalized, knots[0], knots[-1])
+        spline_values = spl(t_clamped) * weight
 
     return raw_inputs, spline_values, normalized
 

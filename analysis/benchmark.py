@@ -39,7 +39,8 @@ def load_target_image(genome_name, img_size=256):
     cppn = CPPN(arch=arch)
     flat = FlattenCPPNParameters(cppn)
     flat.load_jax_flat_params(params)
-    return cppn.generate_image(img_size=img_size)
+    with torch.no_grad():
+        return cppn.generate_image(img_size=img_size)
 
 
 def benchmark_mlp_sgd(genome_name, target_img, n_iters=5000, lr=3e-3, seed=0):
@@ -158,9 +159,59 @@ def get_pretrained_reference(genome_name, source='picbreeder'):
     flat.load_jax_flat_params(params)
 
     with torch.no_grad():
-        final_img = cppn.generate_image(img_size=256)
+        img_size = 256
+        final_img = cppn.generate_image(img_size=img_size)
 
     return {'final_img': final_img, 'model': cppn, 'flat_params': params}
+
+
+def benchmark_kan_sgd_degree(genome_name, target_img, spline_degree=1,
+                              n_iters=1000, lr=3e-3, seed=0, img_size=64):
+    """Train a KAN-CPPN with SGD at a specific spline degree.
+
+    Used for comparing convergence across B-spline degrees.
+
+    Args:
+        genome_name: Genome config key.
+        target_img: Target image tensor.
+        spline_degree: B-spline degree (1-4).
+        n_iters: Number of training iterations.
+        lr: Learning rate.
+        seed: Random seed.
+        img_size: Training image resolution.
+
+    Returns:
+        dict with keys: losses, wall_time, final_img, model, spline_degree
+    """
+    torch.manual_seed(seed)
+    cfg = GENOME_CONFIGS[genome_name]
+    kan = KAN_CPPN(n_layers=cfg['n_layers'], hidden_size=cfg['hidden_size'],
+                   spline_degree=spline_degree)
+
+    # Resize target if needed
+    if target_img.shape[0] != img_size:
+        import torch.nn.functional as F
+        target_resized = target_img.permute(2, 0, 1).unsqueeze(0)
+        target_resized = F.interpolate(target_resized, size=(img_size, img_size), mode='bilinear',
+                                       align_corners=False)
+        target_resized = target_resized.squeeze(0).permute(1, 2, 0)
+    else:
+        target_resized = target_img
+
+    t0 = time.perf_counter()
+    losses, kan = train_sgd(kan, target_resized, lr=lr, n_iters=n_iters, log_interval=0)
+    wall_time = time.perf_counter() - t0
+
+    with torch.no_grad():
+        final_img = kan.generate_image(img_size=img_size)
+
+    return {
+        'losses': losses,
+        'wall_time': wall_time,
+        'final_img': final_img,
+        'model': kan,
+        'spline_degree': spline_degree,
+    }
 
 
 def run_full_benchmark(genome_name, n_iters=5000, n_seeds=3, n_generations=50,

@@ -27,15 +27,16 @@ class SwarmKANCPPNLayer(KANCPPNLayer):
         in_features: Number of input features.
         out_features: Number of output features.
         grid_size: Number of grid points for spline interpolation.
+        spline_degree: B-spline degree (1=linear, 2=quadratic, 3=cubic).
         n_particles: Number of particles in the swarm (including this one).
         inertia: PSO inertia weight (w).
         cognitive: PSO cognitive coefficient (c1 - pull toward personal best).
         social: PSO social coefficient (c2 - pull toward global best).
     """
 
-    def __init__(self, in_features, out_features, grid_size=20,
+    def __init__(self, in_features, out_features, grid_size=20, spline_degree=1,
                  n_particles=5, inertia=0.7, cognitive=1.5, social=1.5):
-        super().__init__(in_features, out_features, grid_size)
+        super().__init__(in_features, out_features, grid_size, spline_degree)
         self.n_particles = n_particles
         self.inertia = inertia
         self.cognitive = cognitive
@@ -103,33 +104,35 @@ class SwarmKAN_CPPN(nn.Module):
         hidden_size: Neurons per hidden layer.
         n_inputs: Number of coordinate inputs (default 4: y, x, d, b).
         grid_size: Grid points for spline interpolation.
+        spline_degree: B-spline degree (1=linear, 2=quadratic, 3=cubic).
         n_particles: Number of PSO particles per layer.
         inertia: PSO inertia weight.
         cognitive: PSO cognitive coefficient.
         social: PSO social coefficient.
     """
 
-    def __init__(self, n_layers, hidden_size, n_inputs=4, grid_size=20,
+    def __init__(self, n_layers, hidden_size, n_inputs=4, grid_size=20, spline_degree=1,
                  n_particles=5, inertia=0.7, cognitive=1.5, social=1.5):
         super().__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.n_inputs = n_inputs
         self.grid_size = grid_size
+        self.spline_degree = spline_degree
 
         layers = []
         # Input layer
         layers.append(SwarmKANCPPNLayer(
-            n_inputs, hidden_size, grid_size, n_particles, inertia, cognitive, social
+            n_inputs, hidden_size, grid_size, spline_degree, n_particles, inertia, cognitive, social
         ))
         # Hidden layers
         for _ in range(n_layers - 1):
             layers.append(SwarmKANCPPNLayer(
-                hidden_size, hidden_size, grid_size, n_particles, inertia, cognitive, social
+                hidden_size, hidden_size, grid_size, spline_degree, n_particles, inertia, cognitive, social
             ))
         # Output layer
         layers.append(SwarmKANCPPNLayer(
-            hidden_size, 3, grid_size, n_particles, inertia, cognitive, social
+            hidden_size, 3, grid_size, spline_degree, n_particles, inertia, cognitive, social
         ))
 
         self.layers = nn.ModuleList(layers)

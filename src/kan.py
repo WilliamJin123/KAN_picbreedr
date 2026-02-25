@@ -15,6 +15,118 @@ import numpy as np
 from .color import hsv2rgb
 
 
+def compute_bspline_basis(x, knots, degree, n_basis):
+    """Compute B-spline basis functions using span-based local evaluation.
+
+    Uses the local support property: at most (degree+1) basis functions are
+    non-zero for any point. Finds each point's knot span via searchsorted,
+    then computes only the non-zero values using a compact recursion.
+
+    Args:
+        x: Tensor of shape (..., in_features) with values in [0, 1].
+        knots: 1D tensor of knot positions (length n_basis + degree + 1).
+        degree: Spline degree (1=linear, 2=quadratic, 3=cubic, etc.).
+        n_basis: Number of basis functions.
+
+    Returns:
+        Tensor of shape (..., in_features, n_basis) with basis values.
+    """
+    orig_shape = x.shape  # (..., in_features)
+    x_flat = x.reshape(-1)  # (N,)
+    N = x_flat.shape[0]
+
+    span = torch.searchsorted(knots, x_flat, right=False) - 1
+    span = span.clamp(degree, n_basis - 1)
+
+    N_local = torch.zeros(N, degree + 1, device=x.device, dtype=x.dtype)
+    N_local[:, 0] = 1.0
+
+    for k in range(1, degree + 1):
+        saved = torch.zeros(N, device=x.device, dtype=x.dtype)
+        for r in range(k):
+            left_knot_idx = span - k + 1 + r
+            right_knot_idx = span + 1 + r
+            left_knot = knots[left_knot_idx.clamp(0, len(knots) - 1)]
+            right_knot = knots[right_knot_idx.clamp(0, len(knots) - 1)]
+            denom = right_knot - left_knot
+            safe_denom = torch.where(denom.abs() > 1e-10, denom, torch.ones_like(denom))
+            temp = torch.where(denom.abs() > 1e-10,
+                               N_local[:, r] / safe_denom,
+                               torch.zeros_like(N_local[:, r]))
+            N_local[:, r] = saved + (right_knot - x_flat) * temp
+            saved = (x_flat - left_knot) * temp
+        N_local[:, k] = saved
+
+    offsets = torch.arange(degree + 1, device=x.device).unsqueeze(0)
+    basis_indices = (span.unsqueeze(1) - degree + offsets).clamp(0, n_basis - 1)
+
+    basis_flat = torch.zeros(N, n_basis, device=x.device, dtype=x.dtype)
+    basis_flat.scatter_add_(1, basis_indices, N_local)
+
+    return basis_flat.reshape(orig_shape + (n_basis,))
+
+
+def eval_bspline_direct(x_norm, knots, degree, n_basis, coeffs, weights):
+    """Evaluate B-spline directly using de Boor's algorithm.
+
+    Skips basis function computation — goes directly from coefficients to
+    spline values. No in-place ops (autograd-safe).
+
+    Args:
+        x_norm: Tensor (batch, in_features) with values in [0, 1].
+        knots: 1D tensor of knot positions.
+        degree: Spline degree.
+        n_basis: Number of basis functions.
+        coeffs: Tensor (out_features, in_features, n_basis).
+        weights: Tensor (out_features, in_features).
+
+    Returns:
+        spline_output: Tensor (batch, out_features).
+    """
+    batch, in_feat = x_norm.shape
+    out_feat = coeffs.shape[0]
+
+    # Find span for each (batch, in_features) point
+    x_flat = x_norm.reshape(-1)
+    span = torch.searchsorted(knots, x_flat, right=False) - 1
+    span = span.clamp(degree, n_basis - 1).reshape(batch, in_feat)
+
+    # Gather local coefficients: (degree+1) per (batch, out, in)
+    offsets = torch.arange(degree + 1, device=x_norm.device)
+    coeff_idx = (span.unsqueeze(-1) - degree + offsets).clamp(0, n_basis - 1)
+    idx_expanded = coeff_idx.unsqueeze(1).expand(batch, out_feat, in_feat, degree + 1)
+    coeffs_expanded = coeffs.unsqueeze(0).expand(batch, out_feat, in_feat, n_basis)
+    d = torch.gather(coeffs_expanded, 3, idx_expanded)  # (batch, out, in, degree+1)
+
+    # Store columns as a list to avoid in-place modification (autograd-safe)
+    cols = [d[..., r] for r in range(degree + 1)]
+
+    for k in range(1, degree + 1):
+        new_cols = list(cols)  # shallow copy of references
+        for r in range(degree, k - 1, -1):
+            left_knot_idx = (span - degree + r).clamp(0, len(knots) - 1)
+            right_knot_idx = (span - degree + r + k).clamp(0, len(knots) - 1)
+            t_left = knots[left_knot_idx]
+            t_right = knots[right_knot_idx]
+
+            denom = t_right - t_left
+            safe_denom = torch.where(denom.abs() > 1e-10, denom, torch.ones_like(denom))
+            alpha = (x_norm - t_left) / safe_denom
+            alpha = torch.where(denom.abs() > 1e-10, alpha, torch.zeros_like(alpha))
+            # Expand alpha: (batch, in_feat) -> (batch, 1, in_feat)
+            alpha = alpha.unsqueeze(1)
+
+            new_cols[r] = (1 - alpha) * cols[r - 1] + alpha * cols[r]
+        cols = new_cols
+
+    # Result is cols[degree]: (batch, out, in)
+    spline_vals = cols[degree]
+
+    # Apply weights and sum over input features
+    weighted = spline_vals * weights.unsqueeze(0)
+    return weighted.sum(dim=2)
+
+
 class KANCPPNLayer(nn.Module):
     """A KAN layer designed for CPPN use.
 
@@ -22,17 +134,28 @@ class KANCPPNLayer(nn.Module):
     inputs to [0, 1] for grid lookup. No bias, matching the original CPPN
     design. Grid spans [0, 1] to match sigmoid output range.
 
+    Supports higher-degree B-splines via the spline_degree parameter.
+    Degree 1 uses the original fast linear interpolation path (bit-identical).
+    Degree >= 2 uses iterative de Boor B-spline basis evaluation.
+
     Args:
         in_features: Number of input features.
         out_features: Number of output features.
         grid_size: Number of grid points for spline interpolation.
+        spline_degree: B-spline degree (1=linear, 2=quadratic, 3=cubic).
     """
 
-    def __init__(self, in_features, out_features, grid_size=20):
+    def __init__(self, in_features, out_features, grid_size=20, spline_degree=1):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.grid_size = grid_size
+        self.spline_degree = spline_degree
+
+        # Number of basis functions (and coefficients) depends on degree
+        # For degree 1 with grid_size knots: n_basis = grid_size (same as before)
+        # For degree k: n_basis = grid_size + degree - 1
+        self.n_basis = grid_size + spline_degree - 1
 
         # Base linear weight (residual path) — prevents signal collapse in deep networks
         # Orthogonal init preserves signal norm exactly through deep layers
@@ -41,7 +164,7 @@ class KANCPPNLayer(nn.Module):
 
         # Spline coefficients for each (output, input) pair
         self.coeffs = nn.Parameter(
-            torch.randn(out_features, in_features, grid_size) * 0.01
+            torch.randn(out_features, in_features, self.n_basis) * 0.01
         )
         # Weights for scaling spline outputs per (output, input) pair
         self.weights = nn.Parameter(
@@ -50,6 +173,16 @@ class KANCPPNLayer(nn.Module):
 
         # Grid spans [0, 1] to match sigmoid normalization
         self.register_buffer('grid', torch.linspace(0, 1, grid_size))
+
+        # For degree >= 2, register clamped knot vector
+        if spline_degree >= 2:
+            interior = torch.linspace(0, 1, grid_size)
+            knots = torch.cat([
+                torch.zeros(spline_degree),
+                interior,
+                torch.ones(spline_degree),
+            ])
+            self.register_buffer('knots', knots)
 
     def forward(self, x):
         """Forward pass with vectorized spline interpolation.
@@ -63,30 +196,36 @@ class KANCPPNLayer(nn.Module):
         # Base linear path (residual) — keeps signal alive through deep networks
         base = x @ self.base_weight.T  # (batch_size, out_features)
 
-        # Normalize to [0, 1] with sigmoid, then map to grid index range [0, grid_size-1]
+        # Normalize to [0, 1] with sigmoid
         x_norm = torch.sigmoid(x)  # (batch_size, in_features)
-        scaled = x_norm * (self.grid_size - 1)  # (batch_size, in_features)
 
-        idx = scaled.long().clamp(0, self.grid_size - 2)  # (batch_size, in_features)
-        frac = scaled - idx.float()  # (batch_size, in_features)
+        if self.spline_degree == 1:
+            # === Fast path: original linear interpolation (bit-identical) ===
+            scaled = x_norm * (self.grid_size - 1)  # (batch_size, in_features)
 
-        # Spline evaluation via gather on (in, out, grid) layout.
-        # coeffs: (out, in, grid) -> permute to (in, out, grid) so gather is along grid dim.
-        coeffs_iog = self.coeffs.permute(1, 0, 2)  # (in, out, grid)
+            idx = scaled.long().clamp(0, self.grid_size - 2)  # (batch_size, in_features)
+            frac = scaled - idx.float()  # (batch_size, in_features)
 
-        # idx: (batch, in) -> (in, batch) -> (in, out, batch) for gathering from (in, out, grid)
-        idx_gather = idx.T.unsqueeze(1).expand(-1, self.out_features, -1)  # (in, out, batch)
-        left = coeffs_iog.gather(2, idx_gather)   # (in, out, batch)
-        right = coeffs_iog.gather(2, idx_gather + 1)  # (in, out, batch)
+            # Spline evaluation via gather on (in, out, grid) layout.
+            coeffs_iog = self.coeffs.permute(1, 0, 2)  # (in, out, grid)
 
-        # Linear interpolation: frac (batch, in) -> (in, 1, batch) for broadcasting
-        frac_t = frac.T.unsqueeze(1)  # (in, 1, batch)
-        interpolated = left + frac_t * (right - left)  # (in, out, batch)
+            idx_gather = idx.T.unsqueeze(1).expand(-1, self.out_features, -1)  # (in, out, batch)
+            left = coeffs_iog.gather(2, idx_gather)   # (in, out, batch)
+            right = coeffs_iog.gather(2, idx_gather + 1)  # (in, out, batch)
 
-        # Apply weights and sum over input features
-        # weights: (out, in) -> (in, out, 1) for broadcasting
-        weighted = interpolated * self.weights.T.unsqueeze(2)  # (in, out, batch)
-        spline_output = weighted.sum(dim=0).T  # (batch, out)
+            frac_t = frac.T.unsqueeze(1)  # (in, 1, batch)
+            interpolated = left + frac_t * (right - left)  # (in, out, batch)
+
+            weighted = interpolated * self.weights.T.unsqueeze(2)  # (in, out, batch)
+            spline_output = weighted.sum(dim=0).T  # (batch, out)
+        else:
+            # === B-spline path: degree >= 2 ===
+            # Direct de Boor evaluation: coefficients -> spline values
+            # Skips basis matrix construction for much better performance
+            spline_output = eval_bspline_direct(
+                x_norm, self.knots, self.spline_degree, self.n_basis,
+                self.coeffs, self.weights
+            )
 
         return base + spline_output
 
@@ -102,23 +241,25 @@ class KAN_CPPN(nn.Module):
         hidden_size: Neurons per hidden layer.
         n_inputs: Number of coordinate inputs (default 4: y, x, d, b).
         grid_size: Grid points for spline interpolation in each KAN layer.
+        spline_degree: B-spline degree (1=linear, 2=quadratic, 3=cubic).
     """
 
-    def __init__(self, n_layers, hidden_size, n_inputs=4, grid_size=20):
+    def __init__(self, n_layers, hidden_size, n_inputs=4, grid_size=20, spline_degree=1):
         super().__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.n_inputs = n_inputs
         self.grid_size = grid_size
+        self.spline_degree = spline_degree
 
         layers = []
         # Input layer: n_inputs -> hidden_size
-        layers.append(KANCPPNLayer(n_inputs, hidden_size, grid_size))
+        layers.append(KANCPPNLayer(n_inputs, hidden_size, grid_size, spline_degree))
         # Hidden layers: hidden_size -> hidden_size
         for _ in range(n_layers - 1):
-            layers.append(KANCPPNLayer(hidden_size, hidden_size, grid_size))
+            layers.append(KANCPPNLayer(hidden_size, hidden_size, grid_size, spline_degree))
         # Output layer: hidden_size -> 3 (h, s, v)
-        layers.append(KANCPPNLayer(hidden_size, 3, grid_size))
+        layers.append(KANCPPNLayer(hidden_size, 3, grid_size, spline_degree))
 
         self.layers = nn.ModuleList(layers)
 
